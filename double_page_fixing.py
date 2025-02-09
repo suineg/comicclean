@@ -38,9 +38,11 @@ class ArchiveHandler:
         self.supported_formats = {'.zip', '.cbz', '.rar', '.cbr'}
         self.temp_dir = Path(tempfile.mkdtemp())
         # Pattern to match four numbers together after a hyphen, plus, or ampersand
-        # e.g., "1213" in "023-1213.jpg" or "12+13" or "12&13"
-        self.double_number_pattern = re.compile(r'[-+&](\d{2})(\d{2})\.')
-        self.connected_number_pattern = re.compile(r'[-+&](\d{2})[-+&](\d{2})\.')
+        # e.g., "1213" in "023-1213.jpg"
+        self.double_number_pattern = re.compile(r'[-+&](\d{2})(\d{2})\.(?i:jpe?g|png)', re.IGNORECASE)
+        # Pattern to match two 3-digit numbers separated by +/&/-
+        # e.g., "033-034" in "GL54-033-034.jpg"
+        self.connected_number_pattern = re.compile(r'[-+&](\d{3})[-+&](\d{3})\.(?i:jpe?g|png)', re.IGNORECASE)
         logging.info('Initialized temporary directory at: %s', self.temp_dir)
 
     def __del__(self):
@@ -74,26 +76,28 @@ class ArchiveHandler:
 
     def find_double_numbers(self, filename: str) -> Optional[Tuple[str, str, str]]:
         """
-        Find instances of four numbers together or two numbers separated by +/& in a filename
+        Find instances of four numbers together or numbers separated by +/& in a filename
         Returns tuple of (prefix, first_number, second_number) if found, None otherwise
-        Example: "Green Lantern 023-1213.JPG" -> ("Green Lantern 023-", "12", "13")
-                "Green Lantern 023-12+13.JPG" -> ("Green Lantern 023-", "12", "13")
-                "Green Lantern 023-12&13.JPG" -> ("Green Lantern 023-", "12", "13")
+        Example: "GL54-033-034.jpg" -> ("GL54", "033", "034")
+                "GL57-020+021.jpg" -> ("GL57", "020", "021")
+                "GL51-006-007.jpg" -> ("GL51", "006", "007")
         """
-        # First try to match four digits together
-        match = self.double_number_pattern.search(filename)
+        # Try to match three-digit numbers separated by +/&/-
+        match = self.connected_number_pattern.search(filename)
         if match:
-            start = match.start(1)
-            prefix = filename[:start-1]  # -1 to include the separator
+            # Get the full string up to the first number
+            start = match.start()
+            prefix = filename[:start]
+            # Extract the numbers
             first_num = match.group(1)
             second_num = match.group(2)
             return (prefix, first_num, second_num)
         
-        # Then try to match numbers separated by +/&
-        match = self.connected_number_pattern.search(filename)
+        # Then try to match four digits together
+        match = self.double_number_pattern.search(filename)
         if match:
-            start = match.start(1)
-            prefix = filename[:start-1]  # -1 to include the separator
+            start = match.start()
+            prefix = filename[:start]
             first_num = match.group(1)
             second_num = match.group(2)
             return (prefix, first_num, second_num)
@@ -103,16 +107,18 @@ class ArchiveHandler:
     def suggest_new_name(self, filename: str, number_match: Tuple[str, str, str]) -> str:
         """
         Generate suggested new filename with underscores everywhere except between split numbers
-        Example: "Green-Lantern-023-1213.jpg" -> "Green_Lantern_023_12-13.jpg"
-                "Green-Lantern-023-12+13.jpg" -> "Green_Lantern_023_12-13.jpg"
-                "Green-Lantern-023-12&13.jpg" -> "Green_Lantern_023_12-13.jpg"
+        Example: "GL54-033-034.jpg" -> "GL54_033-034.jpg"
+                "GL57-020+021.JPG" -> "GL57_020-021.JPG"
+                "Green Lantern 031-0809.JPG" -> "Green Lantern 031_08-09.JPG"
         """
         prefix, first_num, second_num = number_match
-        suffix = filename[len(prefix) + 1 + len(first_num) + len(second_num):]  # +1 for the separator
+        # Find the extension with original case
+        ext_match = re.search(r'\.(?i:jpe?g|png)$', filename)
+        original_ext = ext_match.group(0) if ext_match else ''
         # Convert all hyphens to underscores in the prefix
         modified_prefix = prefix.replace('-', '_')
         # Return with underscore before the split numbers, but hyphen between them
-        return f"{modified_prefix}_{first_num}-{second_num}{suffix}"
+        return f"{modified_prefix}_{first_num}-{second_num}{original_ext}"
 
     def list_archive_contents(self, archive_path: Path) -> Dict[int, str]:
         """
@@ -146,7 +152,7 @@ class ArchiveHandler:
             logging.error('Failed to list contents of %s: %s', archive_path, e)
             raise
 
-    def process_archive(self, archive_path: Path) -> None:
+    def process_archive(self, archive_path: Path, auto_mode: bool = False, dry_run: bool = False, changes_log: List[str] = None) -> None:
         """Process a single archive file"""
         if not self.is_supported(archive_path):
             logging.warning('Unsupported file format: %s', archive_path)
@@ -161,93 +167,120 @@ class ArchiveHandler:
                 logging.warning('No files found in archive: %s', archive_path)
                 return
             
-            # Display contents and instructions
-            print("\n" + "=" * 50)
-            print(f"Archive: {archive_path.name}")
-            print("=" * 50)
-            print("Commands: <number> M to modify, <number> D to delete")
-            print("Example: '17 D' to delete file 17, '20 M' to modify file 20")
-            print("Type 'A' to accept all suggested changes")
-            print("Press Enter without input to finish current archive")
-            print("Type 'X' to exit program completely")
-            print("-" * 50)
-            
             # Track files with suggested changes
             suggested_changes = {}
+            
+            if dry_run:
+                print("\n" + "=" * 50)
+                print(f"Archive: {archive_path}")
+                print("=" * 50)
+                print("The following changes would be made:")
+                print("-" * 50)
+            elif not auto_mode:
+                # Display contents and instructions
+                print("\n" + "=" * 50)
+                print(f"Archive: {archive_path.name}")
+                print("=" * 50)
+                print("Commands: <number> M to modify, <number> D to delete")
+                print("Example: '17 D' to delete file 17, '20 M' to modify file 20")
+                print("Type 'A' to accept all suggested changes")
+                print("Press Enter without input to finish current archive")
+                print("Type 'X' to exit program completely")
+                print("-" * 50)
+            
             for num, filename in files_dict.items():
                 number_match = self.find_double_numbers(filename)
                 if number_match:
                     new_name = self.suggest_new_name(filename, number_match)
                     suggested_changes[filename] = new_name
-                    print(f"{num:3d}. {filename} -> {new_name} (suggested)")
-                else:
+                    if dry_run:
+                        change_msg = f"Would rename: {filename}\n        to: {new_name}"
+                        print(change_msg)
+                        if changes_log is not None:
+                            changes_log.append(change_msg)
+                    elif not auto_mode:
+                        print(f"{num:3d}. {filename} -> {new_name} (suggested)")
+                elif not auto_mode and not dry_run:
                     print(f"{num:3d}. {filename}")
-            print("-" * 50)
             
-            # Process user commands
+            if dry_run:
+                if not suggested_changes:
+                    print("No changes would be made to this archive.")
+                print("-" * 50)
+                return
+            elif not auto_mode:
+                print("-" * 50)
+            
+            # Process user commands or auto-accept changes
             files_to_rename = {}
             files_to_delete = set()
             
-            while True:
-                command = input("\nEnter command (or press Enter to finish): ").strip().upper()
-                if not command:
-                    break
-                
-                if command == 'X':
-                    logging.info('User requested exit')
-                    print("Exiting program...")
-                    sys.exit(0)
-                
-                if command == 'A':
-                    if suggested_changes:
-                        files_to_rename.update(suggested_changes)
-                        print(f"Added {len(suggested_changes)} suggested changes")
-                        continue
-                    else:
-                        print("No suggested changes available")
-                        continue
-                
-                # Parse command
-                parts = command.split()
-                if len(parts) != 2 or parts[1] not in {'M', 'D'}:
-                    print("Invalid command. Use format: '<number> M' or '<number> D'")
-                    continue
-                
-                try:
-                    file_num = int(parts[0])
-                    action = parts[1]
+            if auto_mode:
+                if suggested_changes:
+                    files_to_rename.update(suggested_changes)
+                    logging.info('Auto-accepted %d suggested changes for %s', 
+                               len(suggested_changes), archive_path.name)
+            else:
+                while True:
+                    command = input("\nEnter command (or press Enter to finish): ").strip().upper()
+                    if not command:
+                        break
                     
-                    if file_num not in files_dict:
-                        print("Invalid file number. Please try again.")
+                    if command == 'X':
+                        logging.info('User requested exit')
+                        print("Exiting program...")
+                        sys.exit(0)
+                    
+                    if command == 'A':
+                        if suggested_changes:
+                            files_to_rename.update(suggested_changes)
+                            print(f"Added {len(suggested_changes)} suggested changes")
+                            continue
+                        else:
+                            print("No suggested changes available")
+                            continue
+                    
+                    # Parse command
+                    parts = command.split()
+                    if len(parts) != 2 or parts[1] not in {'M', 'D'}:
+                        print("Invalid command. Use format: '<number> M' or '<number> D'")
                         continue
                     
-                    filename = files_dict[file_num]
-                    
-                    if action == 'D':
-                        # Mark file for deletion
-                        files_to_delete.add(filename)
-                        print(f"Marked for deletion: {filename}")
+                    try:
+                        file_num = int(parts[0])
+                        action = parts[1]
                         
-                    else:  # action == 'M'
-                        number_match = self.find_double_numbers(filename)
-                        if number_match:
-                            suggested_name = self.suggest_new_name(filename, number_match)
-                            print(f"Suggested new name: {suggested_name}")
-                            use_suggested = input("Use suggested name? (y/n): ").lower()
+                        if file_num not in files_dict:
+                            print("Invalid file number. Please try again.")
+                            continue
+                        
+                        filename = files_dict[file_num]
+                        
+                        if action == 'D':
+                            # Mark file for deletion
+                            files_to_delete.add(filename)
+                            print(f"Marked for deletion: {filename}")
                             
-                            if use_suggested == 'y':
-                                files_to_rename[filename] = suggested_name
+                        else:  # action == 'M'
+                            number_match = self.find_double_numbers(filename)
+                            if number_match:
+                                suggested_name = self.suggest_new_name(filename, number_match)
+                                print(f"Suggested new name: {suggested_name}")
+                                use_suggested = input("Use suggested name? (y/n): ").lower()
+                                
+                                if use_suggested == 'y':
+                                    files_to_rename[filename] = suggested_name
+                                else:
+                                    new_name = input("Enter new name: ")
+                                    if new_name:
+                                        files_to_rename[filename] = new_name
                             else:
                                 new_name = input("Enter new name: ")
                                 if new_name:
                                     files_to_rename[filename] = new_name
-                        else:
-                            new_name = input("Enter new name: ")
-                            if new_name:
-                                files_to_rename[filename] = new_name
-                
-                except ValueError:
-                    print("Please enter a valid number.")
+                    
+                    except ValueError:
+                        print("Please enter a valid number.")
             
             # If any changes were requested, process the archive
             if files_to_rename or files_to_delete:
@@ -257,6 +290,14 @@ class ArchiveHandler:
                     self._process_rar(archive_path, files_to_rename, files_to_delete)
             else:
                 logging.info('No changes requested for %s', archive_path)
+            
+            # Capture changes for this archive
+            if changes_log:
+                changes_log.append(f"\n{archive_path}:")
+                for filename, new_name in files_to_rename.items():
+                    changes_log.append(f"{filename} -> {new_name}")
+                for filename in files_to_delete:
+                    changes_log.append(f"Marked for deletion: {filename}")
             
         except Exception as e:
             logging.error('Failed to process archive %s: %s', archive_path, e)
@@ -359,24 +400,109 @@ def main():
     """Main execution function"""
     handler = ArchiveHandler()
     
-    # Get all CBZ and CBR files in current directory
-    current_dir = Path.cwd()
-    archive_files = list(current_dir.glob('*.cbz')) + list(current_dir.glob('*.cbr'))
+    # Check for flags
+    auto_mode = '-a' in sys.argv
+    dry_run = '-d' in sys.argv
+    recursive = '-r' in sys.argv
+    output_file = None
     
-    if not archive_files:
-        logging.error('No CBZ or CBR files found in current directory')
+    # Remove flags from args
+    if auto_mode:
+        sys.argv.remove('-a')
+    if dry_run:
+        sys.argv.remove('-d')
+    if recursive:
+        sys.argv.remove('-r')
+    
+    # Check for output file
+    if '-o' in sys.argv:
+        output_idx = sys.argv.index('-o')
+        if output_idx + 1 >= len(sys.argv):
+            logging.error('No output file specified after -o')
+            return
+        output_file = Path(sys.argv[output_idx + 1])
+        # Remove -o and its argument
+        sys.argv.pop(output_idx)  # Remove -o
+        sys.argv.pop(output_idx)  # Remove file path
+    
+    if auto_mode and dry_run:
+        logging.error('Cannot use both auto mode (-a) and dry run (-d) at the same time')
         return
     
-    logging.info('Found %d archive files', len(archive_files))
+    changes_log = []  # Store all changes for output file
     
-    # Process each archive
-    for archive_path in sorted(archive_files):
+    def process_directory(directory: Path):
+        """Helper function to process a directory"""
+        if recursive:
+            # Use rglob for recursive search
+            archive_files = list(directory.rglob('*.cbz')) + list(directory.rglob('*.cbr'))
+        else:
+            # Use glob for single directory
+            archive_files = list(directory.glob('*.cbz')) + list(directory.glob('*.cbr'))
+        
+        if not archive_files:
+            logging.error('No CBZ or CBR files found in directory: %s', directory)
+            return
+        
+        logging.info('Found %d archive files in %s', len(archive_files), directory)
+        
+        # Process each archive
+        for archive_path in sorted(archive_files):
+            try:
+                if not dry_run:
+                    print(f"\nProcessing: {archive_path}")
+                
+                # Capture changes for this archive
+                if output_file:
+                    changes_log.append(f"\n{archive_path}:")
+                
+                handler.process_archive(archive_path, auto_mode, dry_run, changes_log)
+            except Exception as e:
+                logging.error('Failed to process %s: %s', archive_path, e)
+                continue
+    
+    # Get path from command line or use current directory
+    if len(sys.argv) > 1:
+        path = Path(sys.argv[1])
+        if not path.exists():
+            logging.error('Path not found: %s', path)
+            return
+        
+        if path.is_file():
+            # Process single file
+            if not handler.is_supported(path):
+                logging.error('Unsupported file format: %s', path)
+                return
+            
+            try:
+                if output_file:
+                    changes_log.append(f"\n{path}:")
+                handler.process_archive(path, auto_mode, dry_run, changes_log)
+            except Exception as e:
+                logging.error('Failed to process archive: %s', e)
+                sys.exit(1)
+        
+        elif path.is_dir():
+            # Process directory
+            process_directory(path)
+        
+        else:
+            logging.error('Path is neither a file nor a directory: %s', path)
+            return
+            
+    else:
+        # No argument provided, use current directory
+        process_directory(Path.cwd())
+    
+    # Write changes to output file if specified
+    if output_file and changes_log:
         try:
-            print(f"\nProcessing: {archive_path}")
-            handler.process_archive(archive_path)
+            with open(output_file, 'w') as f:
+                f.write('\n'.join(changes_log))
+            logging.info('Changes written to: %s', output_file)
         except Exception as e:
-            logging.error('Failed to process %s: %s', archive_path, e)
-            continue
+            logging.error('Failed to write changes to output file: %s', e)
 
 if __name__ == "__main__":
     main()
+
